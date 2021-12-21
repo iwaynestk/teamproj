@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from math import sqrt, exp, log
 from scipy.stats import norm
+from scipy.stats.stats import combine_pvalues
 import yfinance as yf
 from strGenerator import riskStrGenerator, paramStrGenerator
 import riskModelling
@@ -216,7 +217,7 @@ def PARAMriskCalc(df, v0, ticker, p, t, estWindow, riskType = 'VaR', estMethod =
 
 
 
-def MCriskCalc(df, v0, ticker, p, t, estWindow, riskType = 'VaR', estMethod = 'window', position = 'long'): 
+def MCriskCalc(df, v0, ticker, p, t, estWindow, riskType = 'VaR', estMethod = 'window', position = 'long', trials = 1000): 
     """
     Generate new columns in original DataFrame which calculates VaR/ES based on Monte Carlo simulations
     
@@ -240,10 +241,10 @@ def MCriskCalc(df, v0, ticker, p, t, estWindow, riskType = 'VaR', estMethod = 'w
 
 
     if riskType == 'VaR': 
-        df[riskLabel] = df.apply(lambda x: riskModelling.MCVaR(x[numLabel], v0, x[muLabel], x[sigmaLabel], p, t, position = position), axis = 1)
+        df[riskLabel] = df.apply(lambda x: riskModelling.MCVaR(x[numLabel], v0, x[muLabel], x[sigmaLabel], p, t, position = position, trials = trials), axis = 1)
         return
     elif riskType == 'ES': 
-        df[riskLabel] = df.apply(lambda x: riskModelling.MCES(x[numLabel], v0, x[muLabel], x[sigmaLabel], p, t, position = position), axis = 1)
+        df[riskLabel] = df.apply(lambda x: riskModelling.MCES(x[numLabel], v0, x[muLabel], x[sigmaLabel], p, t, position = position, trials = trials), axis = 1)
         return
     else: 
         raise ValueError("Only 'VaR' and 'ES' are allowed. ")
@@ -293,18 +294,130 @@ def conditionalMean(df, p):
     return mean
 
 
-# def covm(df, singleTickerList): 
-#     rtnList = []
-#     for i in range(len(singleTickerList)): 
-#         rtnLabel = paramStrGenerator(singleTickerList[i], 'logRtn')
-#         rtnList.append(rtnLabel)
 
-#     covmdf = df[rtnList].rolling(252).cov(pairwise = True)
-#     df = df.join(covmdf, how = 'outer', rsuffix='_covm')
+def targetLiquidate(df, ticker, v0, p, t, iv):
+    """
+    Calculate the proportion of v0 (originally 100% in stock/portfolio) to be liquidated to buy
+    put option in order to decrease VaR by 20%. 
+
+    Args: 
+        df: the original DataFrame containing stock price and VaR
+        ticker: the ticker of the stock you would like to observe
+        v0: initial fund
+        p: quantile (must be within (0, 1)) for VaR (99% VaR -> p = 0.99)
+        t: time horizon of VaR (5d VaR -> t = 5)
+        iv: implied volatility
+
+    Returns: 
+        None
+    """
+
+    # get the label of VaR column in df
+    VaRLabel = riskStrGenerator('PARAM', ticker, p, t, 'VaR', 5, 'window', 'long')
+
+    # generate the label of target VaR column in df and calculate their values
+    targetVaRLabel = 'target_' + VaRLabel
+    df[targetVaRLabel] = 0.8 * df[VaRLabel]
+
+    # generate the label of proportion to be liquidated
+    liquidateLabel = 'liquidate_' + VaRLabel
+
+    # label factory here... 
+    stockLabel = ticker
+    muLabel = paramStrGenerator(ticker, 'mu', 5, 'window')
+    sigmaLabel = paramStrGenerator(ticker, 'sigma', 5, 'window')
+
+    df[liquidateLabel] = df.apply(lambda x: riskModelling.liquidateProportion\
+        (v0, x[stockLabel], x[muLabel], x[sigmaLabel], iv, t / 252, p, 0.005, \
+            x[targetVaRLabel], 0.01, 0.1, 0.01), axis = 1)
+    return
 
 
+def rhoCalc(df, tickerList): 
+    """
+    This function calculate the correlation coefficient of two stocks based on rolling window of length 5 years. 
+
+    Args: 
+        df: the original DataFrame with daily log return of individual stocks
+        tickerList: a list of tickers of stocks. Must be of length 3 with ticker 'portfolio' included
+
+    Returns: 
+        None
+    """
+
+    if len(tickerList) != 3: 
+        raise ValueError("This model only supports rho of 2 stocks as a value. ")
+
+    logRtnLabel1 = paramStrGenerator(tickerList[0], '1dlogRtn')
+    logRtnLabel2 = paramStrGenerator(tickerList[1], '1dlogRtn')
+
+    combinedStr = tickerList[0] + '_' +  tickerList[1]
+
+    covmLabel = paramStrGenerator(combinedStr, 'covm')
+    rhoLabel = paramStrGenerator(combinedStr, 'rho')
+
+    df[covmLabel] = df[logRtnLabel1].rolling(5 * 252).cov(df[logRtnLabel2])
+
+    sigmaLabel1 = paramStrGenerator(tickerList[0], 'sigma', window=5, method='window')
+    sigmaLabel2 = paramStrGenerator(tickerList[1], 'sigma', window=5, method='window')
+
+    df[rhoLabel] = 252 * df[covmLabel] / (df[sigmaLabel1]*df[sigmaLabel2])
+
+    return
+
+  
 
 
+def MCriskCalc_corr(df, tickerList, p, t, estWindow, riskType = 'VaR', estMethod = 'window', trials = 1000, v0 = 100000): 
+    """
+    This function calculates VaR or ES of the portfolio assuming underlying correlated stocks follow GBM, based on Monte Carlo simulations. 
+
+    Args: 
+        df: the original DataFrame containing stock price and VaR
+        tickerList: a list of tickers of stocks. (ticker 'portfolio' must be inside this list)
+        p: quantile (must be within (0, 1)) for VaR (99% VaR -> p = 0.99)
+        t: time horizon of VaR (5d VaR -> t = 5 / 252)
+        estWindow: length of window which corresponds to the parameters (mu, sigma)
+        riskType: 'VaR' or 'ES'
+        estMethod: 'window' or 'exp'
+        trials = number of trials to conduct Monte Carlo simulations. 1000 by default
+        v0: initial fund. 100000 by default 
+    
+    Returns: 
+        None
+    """
+
+    if len(tickerList) != 3: 
+        raise ValueError("MC calculation for correlated stocks only supports portfolios with exactly 2 stocks. ")
+
+    position = 'long'
+
+    # getting labels
+    combinedStr = tickerList[0] + '_' +  tickerList[1]
+
+    rhoLabel = paramStrGenerator(combinedStr, 'rho')
+
+    riskLabel = riskStrGenerator('MC', 'corr_portfolio', p, int(t * 252), riskType=riskType, estWindow=estWindow, estMethod=estMethod, position = position)
+    
+    muLabel1 = paramStrGenerator(tickerList[0], 'mu', window = estWindow, method = estMethod)
+    muLabel2 = paramStrGenerator(tickerList[1], 'mu', window = estWindow, method = estMethod)
+    
+    sigmaLabel1 = paramStrGenerator(tickerList[0], 'sigma', window=estWindow, method=estMethod)
+    sigmaLabel2 = paramStrGenerator(tickerList[1], 'sigma', window=estWindow, method=estMethod)
+
+    numLabel1 = paramStrGenerator(tickerList[0], 'num')
+    numLabel2 = paramStrGenerator(tickerList[1], 'num')
+
+    if riskType == 'VaR': 
+        df[riskLabel] = df.apply(lambda x: riskModelling.MCVaR_corr(x[sigmaLabel1], x[sigmaLabel2], x[muLabel1], x[muLabel2], x[numLabel1], x[numLabel2], \
+            x[tickerList[0]], x[tickerList[1]], x[rhoLabel], t, p, numberOfTrials=trials, v0 = v0), axis = 1)
+        return
+    elif riskType == 'ES': 
+        df[riskLabel] = df.apply(lambda x: riskModelling.MCVaR_corr(x[sigmaLabel1], x[sigmaLabel2], x[muLabel1], x[muLabel2], x[numLabel1], x[numLabel2], \
+            x[tickerList[0]], x[tickerList[1]], x[rhoLabel], t, p, numberOfTrials=trials, v0 = v0), axis = 1)
+        return
+    else: 
+        raise ValueError("Only 'VaR' and 'ES' are allowed. ")
 
 
 

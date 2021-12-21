@@ -155,10 +155,5 @@ class testGBM(unittest.TestCase):
         # unit test passed
 
 
-
-    def testgbmPrice(self): 
-        pass
-
-
 if __name__ == '__main__': 
     unittest.main()
